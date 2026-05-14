@@ -19,7 +19,7 @@ y_pred = rf_classifier.predict(x_test)
 accuracy = accuracy_score(y_test, y_pred)
 classification_rep = classification_report(y_test, y_pred)
 
-print(f"Accuracy: {accuracy:.2f}")
+print(f"\nAccuracy: {accuracy:.2f}")
 print("\nClassification Report:\n", classification_rep)
 
 sample = x_test.iloc[0:1]
