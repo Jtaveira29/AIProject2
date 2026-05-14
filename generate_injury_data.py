@@ -36,6 +36,14 @@ POSITION_WEIGHTS /= POSITION_WEIGHTS.sum()
 # Multiplicados depois pelo factor individual de titularidade.
 BASE_MIN_PER_GAME = {'GK': 90, 'DEF': 82, 'MID': 78, 'FWD': 72}
 
+# Sprints por 90 minutos, por posição. Cada jogador tem o seu valor base
+# individual sampled uniformemente numa janela ±SPRINTS_INDIVIDUAL_WIDTH em
+# torno da média posicional, refletindo estilo individual (uns avançados são
+# mais "fixadores", outros mais corredores).
+# Valores baseados em GPS data real de PL (Catapult/STATSports).
+SPRINTS_BASE = {'GK': 4, 'DEF': 18, 'MID': 28, 'FWD': 25}
+SPRINTS_INDIVIDUAL_WIDTH = 3
+
 # Coeficientes da função de risco verdadeira (logit linear + termos não-lineares).
 # Calibrados manualmente para taxa-base de lesão ~4-6% por semana de exposição.
 BETA = {
@@ -43,14 +51,15 @@ BETA = {
     'age_centered':         0.07,    # (idade-26): linear, mais velho = mais risco
     'history':              0.40,    # preditor #1 na literatura real
     'fragility':            1.7,     # variável latente (não observável)
-    'minutes_acute':        0.35,    # NOVO: carga aguda (última semana) — peso forte
-    'minutes_chronic':      0.10,    # NOVO: carga crónica (3 semanas anteriores) — peso menor
+    'minutes_acute':        0.20,    # carga aguda em minutos — peso reduzido após sprints
+    'minutes_chronic':      0.10,    # carga crónica (3 semanas anteriores) — peso menor
+    'sprints_acute':        0.30,    # NOVO: carga de sprints na última semana (por 25 sprints)
     'games_14d':            0.32,    # densidade competitiva
     'rest_days':           -0.16,    # menos descanso → mais risco
     'recent_injury_bump':   0.60,    # NÃO-LINEAR: degrau quando voltou < 30d
     'age_x_minutes':        0.014,   # INTERAÇÃO: velho + carga = composto
-    'fwd_bonus':            0.22,    # avançados arriscam mais
-    'gk_penalty':          -0.50,    # GKs lesionam-se menos (sem sprints repetidos)
+    'fwd_bonus':            0.08,    # avançados — reduzido (sprints já capta parte)
+    'gk_penalty':          -0.20,    # GKs — reduzido (sprints já capta a maioria)
     'noise_sigma':          0.10,
 }
 
@@ -127,18 +136,29 @@ def simulate_player_season(player, n_weeks):
 
     typ_min_per_game = min(90, BASE_MIN_PER_GAME[player['position']] * starter_factor)
 
+    # Sprint intensity individual: uma vez por jogador, sampleado uniformemente
+    # numa janela ±SPRINTS_INDIVIDUAL_WIDTH em torno da base posicional. Reflete
+    # estilo individual do jogador (uns são mais "fixadores", outros corredores).
+    base_sprints = SPRINTS_BASE[player['position']]
+    typ_sprints_per_90 = float(rng.uniform(base_sprints - SPRINTS_INDIVIDUAL_WIDTH,
+                                            base_sprints + SPRINTS_INDIVIDUAL_WIDTH))
+
     # Pre-época: 4 semanas anteriores de actividade para inicializar janelas
     minutes_history = []
     games_history = []
+    sprints_history = []
     for _ in range(4):
         if rng.random() < 0.08:                # 8% chance de estar lesionado pré-época
             minutes_history.append(0.0)
             games_history.append(0)
+            sprints_history.append(0.0)
         else:
             g = 2 if rng.random() < 0.25 else 1
             m = float(np.clip(rng.normal(typ_min_per_game * g, 15), 0, 90 * g))
+            s = max(0, float(rng.normal(typ_sprints_per_90 * (m / 90), 3.0)))
             minutes_history.append(m)
             games_history.append(g)
+            sprints_history.append(s)
 
     # ---- Loop semanal ----
     for week in range(n_weeks):
@@ -158,15 +178,23 @@ def simulate_player_season(player, n_weeks):
         if is_recovering:
             minutes_this_week = 0.0
             games_played = 0
+            sprints_this_week = 0.0
         else:
             minutes_this_week = float(np.clip(
                 rng.normal(typ_min_per_game * games_scheduled, 15),
                 0, 90 * games_scheduled
             ))
             games_played = games_scheduled
+            # Sprints proporcionais aos minutos jogados, com ruído natural
+            # (alguns jogos têm intensidades diferentes — derbies, blowouts, etc.)
+            sprints_this_week = max(0, float(rng.normal(
+                typ_sprints_per_90 * (minutes_this_week / 90),
+                3.0  # std de ~3 sprints
+            )))
 
         minutes_history.append(minutes_this_week)
         games_history.append(games_played)
+        sprints_history.append(sprints_this_week)
 
         # Features observáveis (janelas)
         # Decomposição da carga em DUAS janelas não-sobrepostas:
@@ -175,6 +203,7 @@ def simulate_player_season(player, n_weeks):
         # Inspirado no acute:chronic workload ratio (ACWR) da ciência do desporto.
         minutes_last_week = minutes_history[-1]
         minutes_prior_3w  = sum(minutes_history[-4:-1])
+        sprints_last_week = sprints_history[-1]
         games_last_14d    = sum(games_history[-2:])
 
         # Dias até ao próximo jogo. Depende do schedule atual:
@@ -203,6 +232,7 @@ def simulate_player_season(player, n_weeks):
                 + BETA['fragility']          * player['fragility_latent']
                 + BETA['minutes_acute']      * (minutes_last_week / 100)
                 + BETA['minutes_chronic']    * (minutes_prior_3w  / 100)
+                + BETA['sprints_acute']      * (sprints_last_week / 25)
                 + BETA['games_14d']          * games_last_14d
                 + BETA['rest_days']          * rest_days_next
                 + BETA['recent_injury_bump'] * (1 if days_since_last_injury < 30 else 0)
@@ -224,6 +254,7 @@ def simulate_player_season(player, n_weeks):
             'history_injuries_2_seasons':  player['history_injuries_2_seasons'],
             'minutes_last_week':           round(minutes_last_week, 0),
             'minutes_prior_3w':            round(minutes_prior_3w,  0),
+            'sprints_last_week':           round(sprints_last_week, 0),
             'games_last_14d':              games_last_14d,
             'days_since_last_injury':      min(days_since_last_injury, 999),
             'rest_days_until_next_game':   rest_days_next,
